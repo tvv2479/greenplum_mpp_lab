@@ -1,2 +1,60 @@
-# greenplum_mpp_lab
-A hands-on Greenplum architecture lab in Docker. Features distributed table design, Data Skew mitigation, and Append-Optimized tables with compression. Includes deep-dive query plan analysis, Motion operations optimization, and advanced MPP engine tuning for maximum performance.
+# Greenplum MPP Cluster & Distributed Architecture Lab
+
+Практический проект по проектированию распределенных архитектур в **Greenplum Database (MPP)**. Проект ориентирован на работу массивной параллельной обработки (Massively Parallel Processing), стратегий шардинга, физического хранения и оптимизации сетевого взаимодействия (`Motion`-операций).
+
+---
+
+## Архитектура и ключевые инженерные концепции
+
+В отличие от классических реляционных СУБД (например, PostgreSQL), Greenplum требует проектирования схем с учетом распределения данных по сегментам (Shared-Nothing architecture). В данном проекте проработаны следующие аспекты:
+
+1. **Композитный шардинг (Multi-column Distribution):** Использование составных ключей распределения (`distributed by (store_id, customer_id)`) для предотвращения проблемы **Data Skew** (перекоса данных на сегментах).
+2. **Многоуровневое партиционирование (Composite Partitioning):** Комбинация секционирования по диапазону (`range` по датам) и спискам (`list` по регионам) для реализации эффективного **Partition Pruning**.
+3. **Физическое хранение OLAP (Append-Optimized Columnar + ZSTD):** Применение колоночного формата хранения и алгоритма сжатия `zstd` для минимизации дискового ввода-вывода (I/O) и экономии места.
+4. **Сетевые оптимизации (`Motion` Tuning):** Использование реплицированных таблиц (`distributed replicated`) для устранения лишнего сетевого трафика при соединениях (`Redistribute Motion`).
+
+---
+
+## Технологический стек
+
+* **СУБД:** Greenplum Database (Open Source)
+* **Инфраструктура:** Docker & Docker Compose (`docker-compose_2.yml`)
+* **Язык запросов:** Advanced SQL (Greenplum/Postgres Dialect)
+
+---
+
+## 📂 Структура репозитория
+
+```text
+greenplum-mpp-architecture-lab/
+├── docker-compose_2.yml      # Развертывание кластера Greenplum в Docker
+├── scripts/
+│   ├── 01_schema_design.sql  # Продвинутый DDL: шардинг, партиции, AO-columnar хранение
+│   └── 02_mpp_analysis.sql   # Анализ планов запросов (EXPLAIN ANALYZE, Motion, Window-функции)
+└── README.md                 # Документация проекта
+```
+
+
+## Разбор ключевых элементов в скриптах
+1. Защита от Data Skew (01_schema_design.sql)
+Если выбрать ключ распределения неудачно (например, по колонке с высокой неравномерностью или низким уникальным набором), 90% данных окажутся на одном сегменте. Использование составного ключа (distributed by (store_id, customer_id)) гарантирует равномерное хеширование и балансировку нагрузки на CPU всех сегментов кластера.
+
+2. Анализ Motion-операций (02_mpp_analysis.sql)
+В плане выполнения (EXPLAIN ANALYZE) сложного аналитического запроса с агрегацией и оконными функциями (`rank()`) отслеживаются следующие узлы:
+
+   * Partition Pruning (Отсечение секций):
+     * Где искать: На самом верхнем уровне сканирования таблицы fact_order_items.
+     * Что означает: Благодаря тому, что таблица разбита по `range(sale_date)` и `list(region_code)`, планировщик по условию `where f.sale_date >= '2026-01-01'` полностью отбросит (пропустит) физические файлы всех секций за прошлые годы, экономя дисковый I/O.
+
+   * Broadcast Motion vs. Redistribute Motion (Сетевые потоки при JOIN):
+     * Если таблица `dim_stores` помечена как `distributed replicated`, при ее соединении с `fact_order_items` мы не увидим сетевых движений (Motion), так как копия магазинов уже физически лежит на каждом сегменте. Это Local Join.
+
+     * А вот если таблица `dim_categories` распределена по ключу `category_id`, а `fact_order_items` — по (store_id, customer_id), то для их соединения движку Greenplum придется выполнить Redistribute Motion. Все строки таблицы категорий будут перераспределены по сети так, чтобы строки с одинаковым `category_id` оказались на тех же сегментах, что и факты.
+
+   * Two-Stage Aggregation (Двухуровневая агрегация):
+     * Где искать: Узлы HashAggregate.
+     * Что означает: Greenplum выполняет оптимизацию: сначала каждый сегмент считает SUM и COUNT локально по своим данным (Partial Aggregation). Затем результаты передаются наверх, и происходит финальное суммирование (Final Aggregation). Это радикально снижает объем передаваемых по сети данных.
+
+   * Gather Motion (Сбор результатов):
+     * Где искать: Самый нижний узел дерева перед выводом клиенту.
+     * Что означает: Оконная функция `rank() over (partition by region_code order by daily_category_revenue desc)` требует наличия всех данных по конкретному региону в одном месте. Поэтому перед расчетом окна данные со всех сегментов пересылаются на **мастер-ноду** или сводятся через Redistribute Motion по region_code, а в самом конце через Gather Motion итоговая таблица отдается клиенту.

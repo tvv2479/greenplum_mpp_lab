@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  greenplum:
+    image: greenplumdb/greenplum-db:latest
+    container_name: local_greenplum
+    ports:
+      - "5432:5432"
+    environment:
+      - MASTER_DATA_DIRECTORY=/data/master/gpseg-1
+    volumes:
+      - gp_data:/data
+    command: >
+      bash -c "gpstartup -a && tail -f /dev/null"
+
+volumes:
+  gp_data:
